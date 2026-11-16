@@ -3270,30 +3270,42 @@ NTSTATUS VioGpuAdapter::HWInit(PCM_RESOURCE_LIST pResList)
         {
             PGPU_VBUFFER vbuf = NULL;
 
-            ctrlQueue.AskCapsetInfo(&vbuf, i);
+            // AskCapsetInfo leaves vbuf NULL when the host does not answer
+            // (it gives up after 10 s), and on success hands the buffer to
+            // the caller (auto_release is off), so check it and release it.
+            if (!ctrlQueue.AskCapsetInfo(&vbuf, i) || vbuf == NULL)
+            {
+                DbgPrint(TRACE_LEVEL_FATAL, ("%s Failed to get info for capset %d\n", __FUNCTION__, i));
+                continue;
+            }
             PGPU_RESP_CAPSET_INFO resp = (PGPU_RESP_CAPSET_INFO)vbuf->resp_buf;
 
             if (!resp)
             {
-                DbgPrint(TRACE_LEVEL_FATAL, ("%s Failed to get info for capset %d", __FUNCTION__, i));
+                DbgPrint(TRACE_LEVEL_FATAL, ("%s Failed to get info for capset %d\n", __FUNCTION__, i));
+                ctrlQueue.ReleaseBuffer(vbuf);
                 continue;
             }
 
             ULONG capset_id = resp->capset_id;
+            ULONG capset_max_size = resp->capset_max_size;
+            ULONG capset_max_version = resp->capset_max_version;
+            ctrlQueue.ReleaseBuffer(vbuf);
+
             if (capset_id > 63 || capset_id <= 0)
             {
                 continue; // Invalid capset id, capsets ids are in range from 1 to 63 per specification
             }
             m_capsetInfos[capset_id].id = capset_id;
-            m_capsetInfos[capset_id].max_size = resp->capset_max_size;
-            m_capsetInfos[capset_id].max_version = resp->capset_max_version;
+            m_capsetInfos[capset_id].max_size = capset_max_size;
+            m_capsetInfos[capset_id].max_version = capset_max_version;
             m_supportedCapsetIDs |= 1ull << capset_id;
             DbgPrint(TRACE_LEVEL_FATAL,
                      ("CAPSET INFO %d    id: %d; version: %d; size: %d\n",
                       i,
                       capset_id,
-                      resp->capset_max_size,
-                      resp->capset_max_version));
+                      capset_max_version,
+                      capset_max_size));
         }
 
     } while (0);
