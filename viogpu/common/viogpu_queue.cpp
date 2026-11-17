@@ -843,6 +843,90 @@ void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT hei
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
 }
 
+// TRANSFER_TO_HOST_2D, then wait for the host's response.  The host answers a
+// command without VIRTIO_GPU_FLAG_FENCE once it has processed it, and the
+// control queue is FIFO, so success also proves that every earlier control
+// command (the resource's CREATE_2D and ATTACH_BACKING) was processed.  This
+// is what a command on ANOTHER virtqueue that reads the resource has to wait
+// for: the cursor queue is not ordered against the control queue, and an
+// UPDATE_CURSOR that overtakes the transfer shows the previous contents.
+BOOLEAN CtrlQueue::TransferToHost2DSync(UINT res_id,
+                                        ULONG offset,
+                                        UINT width,
+                                        UINT height,
+                                        UINT x,
+                                        UINT y,
+                                        ULONG timeoutMs)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%u\n", __FUNCTION__, res_id));
+
+    PGPU_RES_TRANSF_TO_HOST_2D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_TRANSF_TO_HOST_2D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->r.x = x;
+    cmd->r.y = y;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Never reached the host; the callback already fired.
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(timeoutMs, -10000);
+    NTSTATUS status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("---> %s timed out after %u ms res_id=%u\n", __FUNCTION__, timeoutMs, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+    bool error = resp == NULL || resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (error)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("---> %s host rejected the transfer res_id=%u resp=0x%x\n",
+                  __FUNCTION__,
+                  res_id,
+                  resp ? resp->type : 0));
+    }
+    ReleaseBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return !error;
+}
+
 void CtrlQueue::TransferToHost3D(UINT res_id, GPU_BOX *box)
 {
     PAGED_CODE();
@@ -2235,6 +2319,14 @@ UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
     ret = AddBuf(&sg[0], outcnt, 0, buf, NULL, 0);
     Kick();
     Unlock(SavedIrql);
+
+    if ((int)ret < 0)
+    {
+        // Ring full or queue closed: the DPC will never dequeue this buffer,
+        // so free it here instead of leaking it, and report the failure.
+        ReleaseBuffer(buf);
+        res = (UINT)-1;
+    }
 
     DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p outcnt = %d, ret = %d\n", __FUNCTION__, buf, outcnt, ret));
     return res;

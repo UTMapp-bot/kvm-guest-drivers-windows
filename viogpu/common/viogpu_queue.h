@@ -333,6 +333,15 @@ class CtrlQueue : public VioGpuQueue
 		ResFlush(res_id, rect.width, rect.height, rect.x, rect.y);
 	}
     void TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y);
+    // TransferToHost2D that waits up to timeoutMs for the host to process it.
+    // FALSE on timeout, a host error, or a command that never reached the host.
+    BOOLEAN TransferToHost2DSync(UINT res_id,
+                                 ULONG offset,
+                                 UINT width,
+                                 UINT height,
+                                 UINT x,
+                                 UINT y,
+                                 ULONG timeoutMs);
     void TransferToHost3D(UINT res_id, GPU_BOX *box);
 
     void AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents);

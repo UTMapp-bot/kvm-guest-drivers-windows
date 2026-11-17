@@ -124,8 +124,23 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     PKEVENT m_ResolutionEvent;
     HANDLE m_ResolutionEventHandle;
 
+    // Hardware pointer (HWCursor): a 64x64 B8G8R8A8 2D resource backed by
+    // m_CursorSegment and shown through m_CursorQueue.  m_CursorLock (PASSIVE
+    // only) serializes the state below between the pointer DDIs and the
+    // teardown paths (StopDevice, VioGpuAdapterClose, HWClose).
     VioGpuObj *m_pCursorBuf;
     VioGpuMemSegment m_CursorSegment;
+    FAST_MUTEX m_CursorLock;
+    // m_CursorSegment holds the converted image of the last shape Windows
+    // set.  It outlives the host resource across a D3 reset, so the host
+    // cursor is recreated from it on the next pointer update.
+    BOOLEAN m_CursorShapeValid;
+    UINT m_CursorHotX;
+    UINT m_CursorHotY;
+    // Last position and visibility from DxgkDdiSetPointerPosition.
+    BOOLEAN m_CursorVisible;
+    INT m_CursorX;
+    INT m_CursorY;
 
     ULONG m_PciBus;
     ULONG m_PciDev;
@@ -208,6 +223,8 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     BOOLEAN InterruptRoutine(_In_ ULONG MessageNumber);
     VOID DpcRoutine(VOID);
     NTSTATUS QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo);
+    NTSTATUS SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
+    NTSTATUS SetPointerPosition(_In_ CONST DXGKARG_SETPOINTERPOSITION *pSetPointerPosition);
     template <typename DESC> void FillShmemSegment(DESC *pDesc);
     NTSTATUS Escape(_In_ CONST DXGKARG_ESCAPE *pEscape);
     NTSTATUS QueryInterface(_In_ CONST PQUERY_INTERFACE QueryInterface);
@@ -844,6 +861,17 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
 
     NTSTATUS HWInit(PCM_RESOURCE_LIST pResList);
     NTSTATUS HWClose(void);
+
+    // Hardware pointer helpers; callers other than DestroyCursor hold
+    // m_CursorLock.
+    BOOLEAN ConvertPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE *pSetPointerShape);
+    BOOLEAN CreateCursor(void);
+    BOOLEAN UploadCursor(void);
+    BOOLEAN QueueCursorCommand(UINT type, UINT resId, INT x, INT y);
+    // hostAlive: the device was not reset, so the host resource is freed with
+    // commands; otherwise only the guest side is dropped.  forgetShape: also
+    // discard the kept image so nothing is recreated from it.
+    void DestroyCursor(BOOLEAN hostAlive, BOOLEAN forgetShape);
 
     ULONG GetInstanceId(void)
     {
